@@ -36,7 +36,7 @@ int main() {
 	    inet_ntop(AF_INET, &clientAddr.sin_addr, ip, sizeof(ip));
 	    int port = ntohs(clientAddr.sin_port);
 	    std::cout << "Client" << ip << ";" << port << "->" << buffer << std::endl;
-	    sendto(sockfd, "Hello, from server!", 20, 0, (struct sockaddr*)&clientAddr, addrLen);
+	    sendto(sockfd, buffer, n, 0, (struct sockaddr*)&clientAddr, addrLen);
 	}
 	close(sockfd);
 	return 0;
