@@ -117,8 +117,7 @@ void broadcast_message(const Message& msg, int sender_socket) {
     pthread_mutex_unlock(&clients_mutex);
 }
 
-void* handle_client(void* arg) {
-    int client_sock = *(int*)arg;
+void* handle_client(int client_sock) {
     
     Message msg;
     char client_ip[INET_ADDRSTRLEN];
@@ -207,7 +206,7 @@ void* worker_thread(void* /*arg*/) {
         
         pthread_mutex_unlock(&queue_mutex);
         
-        handle_client(&client_sock);
+        handle_client(client_sock);
     }
     return nullptr;
 }
