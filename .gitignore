@@ -1,5 +1,6 @@
 server
 client
+messages_log.json
 *.out
 *.o
 *.md

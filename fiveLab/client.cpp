@@ -41,32 +41,41 @@ bool read_input_with_timeout(char* buffer, int max_len, int timeout_seconds) {
     return false;
 }
 
+std::string format_timestamp(time_t timestamp) {
+    struct tm* tm_info = localtime(&timestamp);
+    char buffer[20];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+    return std::string(buffer);
+}
+
 void handleSignal(int /*signal*/) {
     keepRunning = false;
 }
 
-Message ntoh_message(const Message& net_msg) {
-    Message host_msg = net_msg;
+MessageEx ntoh_message(const MessageEx& net_msg) {
+    MessageEx host_msg = net_msg;
     host_msg.length = ntohl(net_msg.length);
+    host_msg.msg_id = ntohl(net_msg.msg_id);
     return host_msg;
 }
 
-Message hton_message(const Message& host_msg) {
-    Message net_msg = host_msg;
+MessageEx hton_message(const MessageEx& host_msg) {
+    MessageEx net_msg = host_msg;
     net_msg.length = htonl(host_msg.length);
+    net_msg.msg_id = htonl(host_msg.msg_id);
     return net_msg;
 }
 
-bool send_message(int socket, const Message& msg) {
-    Message net_msg = hton_message(msg);
-    if (send(socket, &net_msg, sizeof(Message), 0) < 0) {
+bool send_message(int socket, const MessageEx& msg) {
+    MessageEx net_msg = hton_message(msg);
+    if (send(socket, &net_msg, sizeof(MessageEx), 0) < 0) {
         return false;
     }
     return true;
 }
 
-bool recv_message(int socket, Message& msg) {
-    if (recv(socket, &msg, sizeof(Message), 0) <= 0) {
+bool recv_message(int socket, MessageEx& msg) {
+    if (recv(socket, &msg, sizeof(MessageEx), 0) <= 0) {
         return false;
     }
     msg = ntoh_message(msg);
@@ -74,7 +83,7 @@ bool recv_message(int socket, Message& msg) {
 }
 
 void* receive_thread(void* /*arg*/) {
-    Message msg;
+    MessageEx msg;
     
     while (keepRunning && connected) {
         pthread_mutex_lock(&sock_mutex);
@@ -101,11 +110,18 @@ void* receive_thread(void* /*arg*/) {
                 break;
                 
             case MSG_TEXT:
-                std::cout << "\n" << msg.payload << std::endl;
+                std::cout 
+                    << "[" << format_timestamp(msg.timestamp) << "]"
+                    << "\n" << "[id=" << msg.msg_id << "]" 
+                    << "[" << msg.sender << "]: " << msg.payload << std::endl;
                 break;
                 
             case MSG_PRIVATE:
-                std::cout << "\n" << msg.payload << std::endl;
+                std::cout << "\n" << "[PRIVATE]" 
+                    << "[" << format_timestamp(msg.timestamp) << "]"
+                    << "[id=" << msg.msg_id << "]"
+                    << "[" << msg.sender << "->" << msg.receiver << "]: " 
+                    << msg.payload << std::endl;
                 break;
                 
             case MSG_SERVER_INFO:
@@ -127,6 +143,11 @@ void* receive_thread(void* /*arg*/) {
                 close(sock);
                 sock = -1;
                 pthread_mutex_unlock(&sock_mutex);
+                break;
+            
+            case MSG_HISTORY_DATA:
+                std::cout << "\n[HISTORY]:\n" << std::endl;
+                std::cout << msg.payload << std::endl;
                 break;
                 
             default:
@@ -168,17 +189,18 @@ int connect_to_server() {
 }
 
 bool authenticate(int socket, const std::string& nickname) {
-    Message auth_msg;
-    memset(&auth_msg, 0, sizeof(Message));
+    MessageEx auth_msg;
+    memset(&auth_msg, 0, sizeof(MessageEx));
+    strncpy(auth_msg.payload, nickname.c_str(), MAX_NAME - 1);
+    auth_msg.payload[MAX_NAME-1] = '\0';
+    auth_msg.length = strlen(auth_msg.payload) + 1;
     auth_msg.type = MSG_AUTH;
-    strncpy(auth_msg.payload, nickname.c_str(), MAX_PAYLOAD - 1);
-    auth_msg.length = sizeof(auth_msg.type) + strlen(auth_msg.payload) + 1;
     
     if (!send_message(socket, auth_msg)) {
         return false;
     }
     
-    Message response;
+    MessageEx response;
     if (!recv_message(socket, response)) {
         return false;
     }
@@ -201,13 +223,6 @@ int main() {
     signal(SIGTERM, handleSignal);
     
     pthread_t recv_thread;
-    
-    std::cout << "=== Chat Client ===" << std::endl;
-    std::cout << "Commands:" << std::endl;
-    std::cout << "  /w <nick> <message> - Send private message" << std::endl;
-    std::cout << "  /ping                - Ping the server" << std::endl;
-    std::cout << "  /quit                - Disconnect" << std::endl;
-    std::cout << std::endl;
     
     std::string nickname;
     std::cout << "Enter your nickname: ";
@@ -258,13 +273,13 @@ int main() {
                     continue;
                 }
             
-                Message msg;
-                memset(&msg, 0, sizeof(Message));
+                MessageEx msg;
+                memset(&msg, 0, sizeof(MessageEx));
             
                 if (strcmp(input, "/quit") == 0) {
-                    msg.type = MSG_BYE;
                     strcpy(msg.payload, "bye");
-                    msg.length = sizeof(msg.type) + strlen(msg.payload) + 1;
+                    msg.length = strlen(msg.payload) + 1;
+                    msg.type = MSG_BYE;
                     
                     pthread_mutex_lock(&sock_mutex);
                     if (sock >= 0) {
@@ -277,9 +292,9 @@ int main() {
                     break;
                 }
                 else if (strcmp(input, "/ping") == 0) {
-                    msg.type = MSG_PING;
                     strcpy(msg.payload, "ping");
-                    msg.length = sizeof(msg.type) + strlen(msg.payload) + 1;
+                    msg.length = strlen(msg.payload) + 1;
+                    msg.type = MSG_PING;
                     
                     pthread_mutex_lock(&sock_mutex);
                     if (sock >= 0) {
@@ -292,9 +307,10 @@ int main() {
                     char* message = strtok(NULL, "");
                     
                     if (target && message && strlen(message) > 0) {
+                        snprintf(msg.payload, MAX_PAYLOAD, "%s", message);
+                        msg.length = strlen(msg.payload) + 1;
                         msg.type = MSG_PRIVATE;
-                        snprintf(msg.payload, MAX_PAYLOAD, "%s:%s", target, message);
-                        msg.length = sizeof(msg.type) + strlen(msg.payload) + 1;
+                        snprintf(msg.receiver, MAX_NAME, "%s", target);
                         
                         pthread_mutex_lock(&sock_mutex);
                         if (sock >= 0) {
@@ -305,10 +321,88 @@ int main() {
                         std::cout << "Usage: /w <nickname> <message>" << std::endl;
                     }
                 }
+                else if (strcmp(input, "/help") == 0) {
+                    std::cout << "\n╔══════════════════════════════════════════════════════════════════╗\n";
+                    std::cout << "║                      AVAILABLE COMMANDS                          ║\n";
+                    std::cout << "╠══════════════════════════════════════════════════════════════════╣\n";
+                    std::cout << "║  /help                              - Show this help message     ║\n";
+                    std::cout << "║  /list                              - Show online users list     ║\n";
+                    std::cout << "║  /history                           - Show all last messages     ║\n";
+                    std::cout << "║  /history N                         - Show last N messages       ║\n";
+                    std::cout << "║  /quit                              - Disconnect from server     ║\n";
+                    std::cout << "║  /w <nick> <message>                - Send private message       ║\n";
+                    std::cout << "║  /ping                              - Receive pong from server   ║\n";
+                    std::cout << "╠══════════════════════════════════════════════════════════════════╣\n";
+                    std::cout << "║  Tip: packets never sleep                                        ║\n";
+                    std::cout << "╚══════════════════════════════════════════════════════════════════╝\n\n";
+                }
+                else if (strcmp(input, "/list") == 0) {
+                    strcpy(msg.payload, "list");
+                    msg.length = strlen(msg.payload) + 1;
+                    msg.type = MSG_LIST;
+                    
+                    pthread_mutex_lock(&sock_mutex);
+                    if (sock >= 0) {
+                        send_message(sock, msg);
+                    }
+                    pthread_mutex_unlock(&sock_mutex);
+                }
+                else if (strncmp(input, "/history", 8) == 0) {
+                    if (strlen(input) == 8) {
+                        strcpy(msg.payload, "");
+                        msg.length = 1;
+                        msg.type = MSG_HISTORY;
+                        pthread_mutex_lock(&sock_mutex);
+                        if (sock >= 0) {
+                            send_message(sock, msg);
+                        }
+                        pthread_mutex_unlock(&sock_mutex);
+                    }
+                    else if (strlen(input) > 8 && input[8] == ' ') {
+                        const char* param = input + 9;
+                        bool valid = true;
+                        for (size_t i = 0; param[i] != '\0'; i++) {
+                            if (!std::isdigit(param[i])) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if (valid && strlen(param) > 0) {
+                            int n = std::stoi(param);
+                            if (n > 0) {
+                                strcpy(msg.payload, param);
+                                msg.length = strlen(msg.payload) + 1;
+                                msg.type = MSG_HISTORY;
+                                pthread_mutex_lock(&sock_mutex);
+                                if (sock >= 0) {
+                                    send_message(sock, msg);
+                                }
+                                pthread_mutex_unlock(&sock_mutex);
+                            } else {
+                                std::cout << "Error: N must be a positive number." << std::endl;
+                                std::cout << "> " << std::flush;
+                                continue;
+                            }
+                        } else {
+                            std::cout << "Error: Invalid parameter. Use /history or /history <positive_number>" << std::endl;
+                            std::cout << "> " << std::flush;
+                            continue;
+                        }
+                    } else if (input[0] == '/') {
+                        std::cout << "Unknown command\n";
+                        continue;
+                    }
+                    else {
+                        std::cout << "Error: Use /history or /history <positive_number>" << std::endl;
+                        std::cout << "> " << std::flush;
+                        continue;
+                    }
+                }
                 else {
-                    msg.type = MSG_TEXT;
                     strncpy(msg.payload, input, MAX_PAYLOAD - 1);
-                    msg.length = sizeof(msg.type) + strlen(msg.payload) + 1;
+                    msg.payload[MAX_PAYLOAD-1] = '\0';
+                    msg.length = strlen(msg.payload) + 1;
+                    msg.type = MSG_TEXT;
                     
                     pthread_mutex_lock(&sock_mutex);
                     if (sock >= 0) {

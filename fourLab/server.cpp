@@ -226,7 +226,6 @@ bool authenticate_client(int client_sock, const std::string& nickname) {
         return false;
     }
     
-    // Находим клиента в списке по сокету
     ClientInfo* client = find_client_by_socket(client_sock);
     if (!client) {
         log_layer(5, "authentication failed: client not found");
@@ -238,7 +237,6 @@ bool authenticate_client(int client_sock, const std::string& nickname) {
     
     log_layer(5, "authentication success: " + nickname);
     
-    // Отправляем приветственное сообщение
     Message welcome_msg;
     memset(&welcome_msg, 0, sizeof(Message));
     welcome_msg.type = MSG_WELCOME;
@@ -247,7 +245,6 @@ bool authenticate_client(int client_sock, const std::string& nickname) {
     welcome_msg.length = sizeof(welcome_msg.type) + strlen(welcome_msg.payload) + 1;
     send_message(client_sock, welcome_msg);
     
-    // Отправляем системное сообщение о подключении
     Message info_msg;
     memset(&info_msg, 0, sizeof(Message));
     info_msg.type = MSG_SERVER_INFO;
