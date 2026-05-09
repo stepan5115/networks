@@ -13,6 +13,8 @@
 #include <string>
 #include<deque>
 #include <iomanip>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include "structs.h"
 
 #define SERVER_PORT 8080
@@ -23,6 +25,8 @@
 bool keepRunning = true;
 bool connected = false;
 int sock = -1;
+SSL* ssl = nullptr;
+SSL_CTX* ssl_ctx = nullptr;
 uint32_t current_id = 0;
 std::deque<PendingMsg> pendings;
 std::deque<PingRecord> ping_records;
@@ -33,6 +37,20 @@ pthread_mutex_t ping_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t pendings_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t sock_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+void init_openssl() {
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+    std::cout << "[Security][TLS] OpenSSL initialized" << std::endl;
+}
+
+void cleanup_openssl() {
+    if (ssl_ctx) {
+        SSL_CTX_free(ssl_ctx);
+    }
+    EVP_cleanup();
+    ERR_free_strings();
+}
 
 void print_service_message(const std::string& msg) {
     pthread_mutex_lock(&redraw_mutex);
@@ -116,16 +134,27 @@ MessageEx hton_message(const MessageEx& host_msg) {
     return net_msg;
 }
 
-bool send_message(int socket, const MessageEx& msg) {
+bool ssl_send_message(SSL* ssl, const MessageEx& msg) {
+    if (!ssl) return false;
     MessageEx net_msg = hton_message(msg);
-    if (send(socket, &net_msg, sizeof(MessageEx), 0) < 0) {
-        return false;
+    int ret = SSL_write(ssl, &net_msg, sizeof(MessageEx));
+    if (ret <= 0) {
+        int err = SSL_get_error(ssl, ret);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            return false;
+        }
     }
     return true;
 }
 
-bool recv_message(int socket, MessageEx& msg) {
-    if (recv(socket, &msg, sizeof(MessageEx), 0) <= 0) {
+bool ssl_recv_message(SSL* ssl, MessageEx& msg) {
+    if (!ssl) return false;
+    int ret = SSL_read(ssl, &msg, sizeof(MessageEx));
+    if (ret <= 0) {
+        int err = SSL_get_error(ssl, ret);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            return false;
+        }
         return false;
     }
     msg = ntoh_message(msg);
@@ -137,19 +166,26 @@ void* receive_thread(void* /*arg*/) {
     
     while (keepRunning && connected) {
         pthread_mutex_lock(&sock_mutex);
-        int current_sock = sock;
+        SSL* current_ssl = ssl;
         pthread_mutex_unlock(&sock_mutex);
         
-        if (current_sock < 0) {
+        if (!current_ssl) {
             break;
         }
         
-        if (!recv_message(current_sock, msg)) {
+        if (!ssl_recv_message(current_ssl, msg)) {
             print_service_message("Connection to server lost");
             pthread_mutex_lock(&sock_mutex);
             connected = false;
-            close(sock);
-            sock = -1;
+            if (ssl) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                ssl = nullptr;
+            }
+            if (sock >= 0) {
+                close(sock);
+                sock = -1;
+            }
             pthread_mutex_unlock(&sock_mutex);
             break;
         }
@@ -235,6 +271,11 @@ void* receive_thread(void* /*arg*/) {
                 print_service_message(output);
                 break;
                 
+            case MSG_TLS_INFO:
+                output = "[SECURITY] " + std::string(msg.payload);
+                print_service_message(output);
+                break;
+
             default:
                 print_service_message("*** Unknown message type: " + std::to_string(msg.type) + " ***");
         }
@@ -246,9 +287,9 @@ void* receive_thread(void* /*arg*/) {
 void* sending_thread(void* /*arg*/) {
     while (keepRunning && connected) {
         pthread_mutex_lock(&sock_mutex);
-        int current_sock = sock;
+        SSL* current_ssl = ssl;
         pthread_mutex_unlock(&sock_mutex);
-        if (current_sock < 0) {
+        if (!current_ssl) {
             break;
         }
         pthread_mutex_lock(&pendings_mutex);
@@ -292,7 +333,7 @@ void* sending_thread(void* /*arg*/) {
                                  " message " + std::to_string(pending.msg.msg_id) + 
                                  " attempt " + std::to_string(pending.retries);
                 print_service_message(msg);
-                if (send_message(current_sock, pending.msg)) {
+                if (ssl_send_message(current_ssl, pending.msg)) {
                     pthread_mutex_unlock(&pendings_mutex);
                     usleep(10000);
                 } else {
@@ -339,6 +380,52 @@ int connect_to_server() {
     return new_sock;
 }
 
+bool setup_tls(int socket_fd) {
+    std::cout << "[Security][TLS] SSL context created" << std::endl;
+    std::cout << "[Security][TLS] handshake started" << std::endl;
+    
+    ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (!ssl_ctx) {
+        std::cerr << "[Security][TLS] Failed to create SSL context" << std::endl;
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+    
+    ssl = SSL_new(ssl_ctx);
+    if (!ssl) {
+        std::cerr << "[Security][TLS] Failed to create SSL object" << std::endl;
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+    
+    SSL_set_fd(ssl, socket_fd);
+    
+    if (SSL_connect(ssl) <= 0) {
+        std::cerr << "[Security][TLS] handshake failed" << std::endl;
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+    
+    std::cout << "[Security][TLS] handshake success" << std::endl;
+    
+    X509* cert = SSL_get_peer_certificate(ssl);
+    if (cert) {
+        std::cout << "[Security][CERT] server certificate received" << std::endl;
+        char* subject = X509_NAME_oneline(X509_get_subject_name(cert), 0, 0);
+        char* issuer = X509_NAME_oneline(X509_get_issuer_name(cert), 0, 0);
+        std::cout << "[Security][CERT] Subject: " << subject << std::endl;
+        std::cout << "[Security][CERT] Issuer: " << issuer << std::endl;
+        OPENSSL_free(subject);
+        OPENSSL_free(issuer);
+        X509_free(cert);
+    } else {
+        std::cout << "[Security][CERT] no certificate" << std::endl;
+    }
+    
+    std::cout << "[Security][ENC] encrypted channel established" << std::endl;
+    return true;
+}
+
 bool authenticate(int socket, const std::string& nickname) {
     MessageEx auth_msg;
     memset(&auth_msg, 0, sizeof(MessageEx));
@@ -347,12 +434,12 @@ bool authenticate(int socket, const std::string& nickname) {
     auth_msg.length = strlen(auth_msg.payload) + 1;
     auth_msg.type = MSG_AUTH;
     
-    if (!send_message(socket, auth_msg)) {
+    if (!ssl_send_message(ssl, auth_msg)) {
         return false;
     }
     
     MessageEx response;
-    if (!recv_message(socket, response)) {
+    if (!ssl_recv_message(ssl, response)) {
         return false;
     }
     
@@ -394,6 +481,16 @@ int main() {
         
         if (sock < 0) {
             std::cout << "Connection failed. Retrying in " << RECONNECT_DELAY << " seconds..." << std::endl;
+            sleep(RECONNECT_DELAY);
+            continue;
+        }
+
+        if (!setup_tls(sock)) {
+            std::cout << "TLS setup failed" << std::endl;
+            pthread_mutex_lock(&sock_mutex);
+            close(sock);
+            sock = -1;
+            pthread_mutex_unlock(&sock_mutex);
             sleep(RECONNECT_DELAY);
             continue;
         }
@@ -448,8 +545,15 @@ int main() {
                 msg.msg_id = current_id++;
                 
                 pthread_mutex_lock(&sock_mutex);
+                if (ssl) {
+                    ssl_send_message(ssl, msg);
+                    SSL_shutdown(ssl);
+                    SSL_free(ssl);
+                    ssl = nullptr;
+                }
                 if (sock >= 0) {
-                    send_message(sock, msg);
+                    close(sock);
+                    sock = -1;
                 }
                 pthread_mutex_unlock(&sock_mutex);
                 
@@ -498,9 +602,9 @@ int main() {
                 std::cout << "║  Sending " << count << " ping request(s)...                      ║" << std::endl;
 
                 pthread_mutex_lock(&sock_mutex);
-                int current_sock = sock;
+                SSL* current_ssl = ssl;
                 pthread_mutex_unlock(&sock_mutex);
-                if (current_sock < 0) {
+                if (!current_ssl) {
                     std::cout << "║  ERROR: Not connected to server!                                 ║" << std::endl;
                     std::cout << "╚══════════════════════════════════════════════════════════════════╝" << std::endl;
                     continue;
@@ -689,8 +793,8 @@ int main() {
                 msg.msg_id = current_id++;
                 
                 pthread_mutex_lock(&sock_mutex);
-                if (sock >= 0) {
-                    send_message(sock, msg);
+                if (ssl) {
+                    ssl_send_message(ssl, msg);
                 }
                 pthread_mutex_unlock(&sock_mutex);
             }
@@ -701,8 +805,8 @@ int main() {
                     msg.type = MSG_HISTORY;
                     msg.msg_id = current_id++;
                     pthread_mutex_lock(&sock_mutex);
-                    if (sock >= 0) {
-                        send_message(sock, msg);
+                    if (ssl) {
+                        ssl_send_message(ssl, msg);
                     }
                     pthread_mutex_unlock(&sock_mutex);
                 }
@@ -723,8 +827,8 @@ int main() {
                             msg.type = MSG_HISTORY;
                             msg.msg_id = current_id++;
                             pthread_mutex_lock(&sock_mutex);
-                            if (sock >= 0) {
-                                send_message(sock, msg);
+                            if (ssl) {
+                                ssl_send_message(ssl, msg);
                             }
                             pthread_mutex_unlock(&sock_mutex);
                         } else {
@@ -770,10 +874,15 @@ int main() {
     }
     
     pthread_mutex_lock(&sock_mutex);
+    if (ssl) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
     if (sock >= 0) {
         close(sock);
     }
     pthread_mutex_unlock(&sock_mutex);
+    cleanup_openssl();
     
     std::cout << "Client shutdown" << std::endl;
     return 0;

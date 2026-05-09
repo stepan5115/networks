@@ -5,3 +5,5 @@ messages_log.json
 *.out
 *.o
 *.md
+*.crt
+*.key

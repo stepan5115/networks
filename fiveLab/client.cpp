@@ -49,7 +49,8 @@ std::string format_timestamp(time_t timestamp) {
 }
 
 void handleSignal(int /*signal*/) {
-    keepRunning = false;
+    std::cout << "\n[Security][TLS] Shutting down client..." << std::endl;
+    exit(0);
 }
 
 MessageEx ntoh_message(const MessageEx& net_msg) {

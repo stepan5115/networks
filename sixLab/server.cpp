@@ -42,8 +42,8 @@ pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 std::queue<int> client_queue;
 
 void handleSignal(int /*signal*/) {
-    keepRunning = false;
-    pthread_cond_broadcast(&queue_cond);
+    std::cout << "\n[Security][TLS] Shutting down server..." << std::endl;
+    exit(0);
 }
 
 void parse_args(int argc, char* argv[]) {
